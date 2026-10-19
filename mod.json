@@ -1,9 +1,12 @@
 {
-  "geode": "5.11.2",
-  "gd": { "android": "2.2081", "win": "2.2081" },
-  "version": "v0.1.0",
-  "id": "ai.predictivebuffer.recreated",
-  "name": "Predictive Input Buffer (Recreation Prototype)",
-  "developer": "Community recreation",
-  "description": "Cross-platform prototype of the configurable input-buffer stages. Gameplay prediction integration is not yet implemented."
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"ios": "*"
+	},
+	"version": "v1.1.0",
+	"id": "ai.predictivebuffer",
+	"name": "Predictive Input Buffer",
+	"developer": "lilWC",
+	"description": "Trajectory-based 1-2 frame press and wave release input buffer."
 }
