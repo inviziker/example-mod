@@ -1,17 +1,35 @@
 {
-	"geode": "$GEODE_VERSION",
+	"geode": "5.9.0",
 	"gd": {
 		"win": "2.2081",
 		"android": "2.2081",
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "$idkidk_ID",
-	"name": "$buffers_NAME",
-	"version": "$MOD_VERSION",
-	"developer": "$MOD_DEVELOPER",
-	"description": "$MOD_DESCRIPTION",
+	"id": "idkidk.buffers",
+	"name": "Buffers",
+	"version": "v1.0.0",
+	"developer": "idkidk",
+	"description": "Click buffer: clicks made a few frames early still fire when you land.",
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"
+	},
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enable click buffer",
+			"default": true
+		},
+		"window-ms": {
+			"type": "int",
+			"name": "Buffer window (ms)",
+			"description": "How early a click can be and still count. 100 ms is about 6 frames at 60 FPS.",
+			"default": 100,
+			"min": 30,
+			"max": 200,
+			"control": {
+				"slider": true
+			}
+		}
 	}
 }
