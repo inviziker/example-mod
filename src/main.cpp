@@ -11,8 +11,8 @@
 #include <algorithm>
 #include <string>
 
-// Windows-only: console window + F6 hotkey. Everything else (iOS, ...) uses the
-// pause-menu button and Geode's log instead.
+// Windows-only: console window + F6 hotkey. Everything else (Android, iOS, ...) uses the
+// pause-menu button instead.
 #ifdef GEODE_IS_WINDOWS
     #include <Windows.h>
 #endif
@@ -28,6 +28,27 @@ using namespace geode::prelude;
 // This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
 constexpr int SPAM_INTERVAL_TICKS = 8;
 constexpr int SPAM_STREAK_REQUIRED = 3;
+
+// ============================================================================
+//  PERFORMANCE SETTINGS (these keep the frame rate steady on phones)
+// ============================================================================
+
+// Hard cap on simulated physics steps per click/release. Each click that is in
+// danger runs several "what if I delayed this click" simulations; on high stages
+// that used to be thousands of steps in a single frame, which is what caused the
+// lag. Once this many steps are used, the scan stops and the best delay found so
+// far is used (or the raw input if none was found).
+//   Lower  = smoother frame rate, slightly less thorough on the high stages.
+//   Higher = more thorough, but bigger lag spikes on slow phones.
+constexpr int MAX_SIM_STEPS_PER_INPUT = 3000;
+
+// For delays above 16 ticks (stages 6-9), test every Nth delay instead of every
+// single one. Delays 1-16 are always tested one by one. Set to 1 to test all.
+constexpr int LARGE_DELAY_STRIDE = 2;
+
+// Console / log output. Printing during gameplay can cause hitches, so it is off
+// by default. Set to true if you want to see the "SAVED +N TICKS" messages.
+constexpr bool DEBUG_LOG = false;
 
 // ============================================================================
 
@@ -76,6 +97,9 @@ private:
     // Streak-based Spam Guard state
     int  m_ticksSinceLastInput = 999;
     int  m_rapidInputStreak = 0;
+
+    // Simulation work counter for the current input (see MAX_SIM_STEPS_PER_INPUT)
+    int  m_stepsUsed = 0;
 
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
@@ -133,6 +157,7 @@ public:
         m_firingBuffered = false;
         m_ticksSinceLastInput = 999;
         m_rapidInputStreak = 0;
+        m_stepsUsed = 0;
     }
 
     void quit() {
@@ -166,7 +191,7 @@ public:
 
         if (announce) {
             auto msg = presetText();
-            bufLog("[InputBuffer] Cycle -> " + msg);
+            if (DEBUG_LOG) bufLog("[InputBuffer] Cycle -> " + msg);
             Notification::create(msg, NotificationIcon::None, 1.f)->show();
         }
     }
@@ -216,11 +241,15 @@ public:
     int getSurvivalTicks(PlayLayer* pl, PlayerObject* realP1, PlayerObject* realP2, bool isDual, int delayFrames, bool actionPush, int maxTicks) {
         if (!pl || !m_simPlayer1 || !realP1) return maxTicks;
 
+        // Second sim player is only used when the real player 2 exists in Dual mode.
+        const bool dual2 = isDual && m_simPlayer2 && realP2;
+        const int stepCost = dual2 ? 2 : 1;
+
         m_simulating = true;
         m_simulationDead = false;
 
         syncSimPlayer(m_simPlayer1, realP1);
-        if (isDual && m_simPlayer2 && realP2) {
+        if (dual2) {
             syncSimPlayer(m_simPlayer2, realP2);
         }
 
@@ -228,42 +257,45 @@ public:
         if (delayFrames > 0) {
             if (!actionPush) {
                 m_simPlayer1->pushButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
+                if (dual2) {
                     m_simPlayer2->pushButton(PlayerButton::Jump);
                 }
             } else {
                 m_simPlayer1->releaseButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
+                if (dual2) {
                     m_simPlayer2->releaseButton(PlayerButton::Jump);
                 }
             }
         }
 
-        float dt = getValidDt();
+        const float dt = getValidDt();
         int survived = 0;
-        bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
-                                (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
+        const bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
+                                      (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
         int airborneTicks = 0;
         int safeLandedTicks = 0;
 
-        for (int i = 0; i < delayFrames + maxTicks; i++) {
+        const int totalSteps = delayFrames + maxTicks;
+        for (int i = 0; i < totalSteps; i++) {
             if (i == delayFrames) {
                 if (actionPush) {
                     m_simPlayer1->pushButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
+                    if (dual2) {
                         m_simPlayer2->pushButton(PlayerButton::Jump);
                     }
                 } else {
                     m_simPlayer1->releaseButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
+                    if (dual2) {
                         m_simPlayer2->releaseButton(PlayerButton::Jump);
                     }
                 }
             }
 
+            m_stepsUsed += stepCost;
+
             m_simPlayer1->update(dt);
             m_simPlayer1->updateRotation(dt);
-            if (isDual && m_simPlayer2) {
+            if (dual2) {
                 m_simPlayer2->update(dt);
                 m_simPlayer2->updateRotation(dt);
             }
@@ -273,7 +305,7 @@ public:
             pl->checkCollisions(m_simPlayer1, dt, false);
             if (m_simulationDead) break;
 
-            if (isDual && m_simPlayer2 && realP2) {
+            if (dual2) {
                 resetCollisionLog(m_simPlayer2);
                 pl->checkCollisions(m_simPlayer2, dt, false);
                 if (m_simulationDead) break;
@@ -283,7 +315,7 @@ public:
                 survived++;
                 if (!isContinuousMode) {
                     bool p1Grounded = m_simPlayer1->m_isOnGround;
-                    bool p2Grounded = (!isDual || !m_simPlayer2) ? true : m_simPlayer2->m_isOnGround;
+                    bool p2Grounded = dual2 ? m_simPlayer2->m_isOnGround : true;
                     if (!p1Grounded || !p2Grounded) {
                         airborneTicks++;
                         safeLandedTicks = 0;
@@ -405,6 +437,9 @@ public:
             targetHorizon += maxDelayFrames - 16;
         }
 
+        // Start counting simulation work for this input.
+        m_stepsUsed = 0;
+
         // 4. Check Frame 0 (immediate input) across the full trajectory horizon
         int ticksFrame0 = getSurvivalTicks(pl, p1, p2, isDual, 0, push, targetHorizon);
         if (ticksFrame0 >= targetHorizon) {
@@ -412,12 +447,24 @@ public:
             return true;
         }
 
+        // Last delay worth testing.
+        int scanLimit = maxDelayFrames;
+        if (isWave) {
+            // EXACT shortcut (does not change results): a Wave delay is only accepted if it gains at
+            // least (2 * delay + 6) ticks over Frame 0, and a simulation can never survive more than
+            // targetHorizon ticks. So any larger delay can never be accepted -- skip simulating them.
+            scanLimit = std::min(scanLimit, (targetHorizon - ticksFrame0 - 6) / 2);
+        }
+
         // 5. Frame 0 hits a spike, sawblade, or slope within the horizon!
-        // Scan +1..maxDelayFrames for the earliest delay that genuinely clears the obstacle.
+        // Scan +1..scanLimit for the earliest delay that genuinely clears the obstacle.
         int bestDelay = 0;
         int bestTicks = ticksFrame0;
 
-        for (int delay = 1; delay <= maxDelayFrames; delay++) {
+        for (int delay = 1; delay <= scanLimit; delay += (delay < 16 ? 1 : LARGE_DELAY_STRIDE)) {
+            // Work cap: keeps the frame time bounded no matter which stage is selected.
+            if (m_stepsUsed >= MAX_SIM_STEPS_PER_INPUT) break;
+
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
 
             if (isWave) {
@@ -450,13 +497,16 @@ public:
         }
 
         if (bestDelay > 0) {
-            bufLog(fmt::format("[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! (Frame0: {} -> Delayed: {}) [Limit: {}] ***",
-                bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames));
+            if (DEBUG_LOG) {
+                bufLog(fmt::format("[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! (Frame0: {} -> Delayed: {}) [Limit: {}] ***",
+                    bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames));
+            }
             m_bufferedPush = push;
             m_waitTicks = bestDelay;
             return false;
         }
 
+        (void)act;
         m_gameHolding = push;
         return true;
     }
@@ -526,17 +576,21 @@ static TrajectoryBufferSim s_sim;
 
 $on_mod(Loaded) {
 #ifdef GEODE_IS_WINDOWS
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
+    if (DEBUG_LOG) {
+        AllocConsole();
+        FILE* f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
+    }
 #endif
     s_sim.loadSavedPreset();
-    bufLog("============================================================");
-    bufLog(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)");
-    bufLog(" [InputBuffer] Starting Mode: " + s_sim.presetText());
-    bufLog(" [InputBuffer] Cycle stages: 2/2 4/4 8/8 16/8 24 32 48 54 60 OFF (F6 on Windows, pause-menu button elsewhere)");
-    bufLog("============================================================");
+    if (DEBUG_LOG) {
+        bufLog("============================================================");
+        bufLog(" [InputBuffer] v4.7 LOADED (Performance: bounded lookahead work)");
+        bufLog(" [InputBuffer] Starting Mode: " + s_sim.presetText());
+        bufLog(" [InputBuffer] Cycle stages: 2/2 4/4 8/8 16/8 24 32 48 54 60 OFF (F6 on Windows, pause-menu button elsewhere)");
+        bufLog("============================================================");
+    }
 }
 
 class $modify(BufPlayLayer, PlayLayer) {
@@ -671,8 +725,11 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (s_sim.isSimulating()) {
-            gd::vector<GameObject*> extra;
-            extra.reserve(objectsCount);
+            // This runs once per simulated tick (thousands of times per click), so the filtered
+            // list is kept in one reusable buffer instead of allocating a new vector every call.
+            static gd::vector<GameObject*> s_filtered;
+            s_filtered.clear();
+            s_filtered.reserve(objectsCount);
             for (int i = 0; i < objectsCount; i++) {
                 GameObject* obj = vec->at(i);
                 if (!obj) continue;
@@ -681,10 +738,10 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     obj->m_objectType == GameObjectType::AnimatedHazard ||
                     obj->m_objectType == GameObjectType::CollisionObject ||
                     obj->m_objectType == GameObjectType::Slope) {
-                    extra.push_back(obj);
+                    s_filtered.push_back(obj);
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
+            GJBaseGameLayer::collisionCheckObjects(player, &s_filtered, static_cast<int>(s_filtered.size()), dt);
             return;
         }
         GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
@@ -696,7 +753,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     }
 };
 
-// Pause-menu button: cycles the buffer stage (this is how you change it on iOS).
+// Pause-menu button: cycles the buffer stage (this is how you change it on Android / iOS).
 class $modify(BufPauseLayer, PauseLayer) {
     struct Fields {
         CCLabelBMFont* m_stageLabel = nullptr;
