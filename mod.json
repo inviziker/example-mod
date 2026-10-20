@@ -1,184 +1,144 @@
 {
-    "geode": "5.11.2",
-    "gd": {
-        "win": "2.2081",
-        "android": "2.2081",
-        "mac": "2.2081"
-    },
-    "version": "v1.1.0",
-    "id": "ai.predictivebuffer",
-    "name": "Predictive Input Buffer",
-    "developer": "lilWC",
-    "description": "Trajectory-based predictive input buffer for presses and wave releases. Up to 1 second of buffer, fully configurable in the mod settings.",
-    "settings": {
-        "title-general": {
-            "type": "title",
-            "name": "General"
-        },
-        "enabled": {
-            "type": "bool",
-            "name": "Enable Input Buffer",
-            "description": "Master switch. When off, every click and release reaches the game completely untouched.",
-            "default": true
-        },
-        "title-buffer": {
-            "type": "title",
-            "name": "Buffer Strength",
-            "description": "How far a click may be delayed to save you. 4 ticks = 1 frame at 60 FPS. 240 ticks = 1 second."
-        },
-        "normal-ticks": {
-            "type": "int",
-            "name": "Buffer Ticks (All Modes)",
-            "description": "Maximum delay in ticks for every gamemode except Wave. 0 turns the buffer off for these modes.",
-            "default": 2,
-            "min": 0,
-            "max": 240,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1,
-                "big-arrows": true,
-                "big-arrow-step": 10
-            },
-            "enable-if": "enabled",
-            "enable-if-description": "Turn on \"Enable Input Buffer\" first."
-        },
-        "wave-ticks": {
-            "type": "int",
-            "name": "Buffer Ticks (Wave)",
-            "description": "Maximum delay in ticks while in Wave / Mini Wave. 0 turns the buffer off for Wave.",
-            "default": 2,
-            "min": 0,
-            "max": 240,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1,
-                "big-arrows": true,
-                "big-arrow-step": 10
-            },
-            "enable-if": "enabled",
-            "enable-if-description": "Turn on \"Enable Input Buffer\" first."
-        },
-        "title-spam": {
-            "type": "title",
-            "name": "Wave Spam Guard",
-            "description": "Lets fast wave spam bypass the buffer so the buffer never eats your spam."
-        },
-        "spam-guard": {
-            "type": "bool",
-            "name": "Spam Guard",
-            "description": "When you spam the wave quickly, the buffer steps aside. Single clicks and normal wave turns stay fully protected.",
-            "default": true,
-            "enable-if": "enabled",
-            "enable-if-description": "Turn on \"Enable Input Buffer\" first."
-        },
-        "spam-interval": {
-            "type": "int",
-            "name": "Spam Speed (ticks)",
-            "description": "Inputs closer together than this many ticks count as spam. Higher = the guard triggers more easily.",
-            "default": 8,
-            "min": 1,
-            "max": 32,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1
-            },
-            "enable-if": "enabled && spam-guard",
-            "enable-if-description": "Needs both \"Enable Input Buffer\" and \"Spam Guard\"."
-        },
-        "spam-streak": {
-            "type": "int",
-            "name": "Spam Streak",
-            "description": "How many fast inputs in a row it takes before the guard steps in. Higher = the guard triggers less easily.",
-            "default": 3,
-            "min": 2,
-            "max": 10,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1
-            },
-            "enable-if": "enabled && spam-guard",
-            "enable-if-description": "Needs both \"Enable Input Buffer\" and \"Spam Guard\"."
-        },
-        "title-performance": {
-            "type": "title",
-            "name": "Performance",
-            "description": "Keep the frame rate steady, especially on phones."
-        },
-        "lookahead-ms": {
-            "type": "int",
-            "name": "Lookahead Time Limit (ms)",
-            "description": "How long the buffer may search for a safe delay on each click. Lower = steadier frame rate on weak phones. Higher = searches further, which helps very high tick values.",
-            "default": 5,
-            "min": 1,
-            "max": 30,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1
-            },
-            "enable-if": "enabled",
-            "enable-if-description": "Turn on \"Enable Input Buffer\" first."
-        },
-        "scan-stride": {
-            "type": "int",
-            "name": "Search Step (Large Delays)",
-            "description": "For delays above 16 ticks, only every Nth delay is tested. 1 = most thorough but slowest.",
-            "default": 2,
-            "min": 1,
-            "max": 8,
-            "control": {
-                "slider": true,
-                "slider-step": 1,
-                "input": true,
-                "arrows": true,
-                "arrow-step": 1
-            },
-            "enable-if": "enabled",
-            "enable-if-description": "Turn on \"Enable Input Buffer\" first."
-        },
-        "title-display": {
-            "type": "title",
-            "name": "Display & Debug"
-        },
-        "show-hud": {
-            "type": "bool",
-            "name": "Show Status Label",
-            "description": "Shows the current buffer ticks (all modes / wave) and how many clicks the buffer has saved this run.",
-            "default": false
-        },
-        "hud-corner": {
-            "type": "string",
-            "name": "Label Position",
-            "description": "Which screen corner the status label sits in.",
-            "default": "Bottom Left",
-            "one-of": [
-                "Bottom Left",
-                "Bottom Right",
-                "Top Left",
-                "Top Right"
-            ],
-            "enable-if": "show-hud",
-            "enable-if-description": "Turn on \"Show Status Label\" first."
-        },
-        "debug-log": {
-            "type": "bool",
-            "name": "Debug Log",
-            "description": "Writes a line to the Geode log every time the buffer saves a click. Can cause tiny hitches, so leave it off for normal play.",
-            "default": false
-        }
-    }
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081"
+	},
+	"version": "v1.2.0",
+	"id": "ai.predictivebuffer",
+	"name": "Predictive Input Buffer",
+	"developer": "lilWC",
+	"description": "Smart input buffer that simulates your trajectory and only delays a click when it actually saves you.",
+	"tags": ["gameplay", "utility"],
+	"settings": {
+		"title-general": {
+			"type": "title",
+			"name": "General"
+		},
+		"enabled": {
+			"type": "bool",
+			"name": "Enabled",
+			"description": "Master switch. Turn this off to disable the buffer completely.",
+			"default": true
+		},
+		"normal-ticks": {
+			"type": "int",
+			"name": "Buffer Strength",
+			"description": "Maximum delay for normal modes (cube, ball, UFO, robot, spider, swing). <cy>1 tick = 1/240s</c>, 4 ticks = 1 frame @ 60 FPS. <cr>0 = off</c>.",
+			"default": 2,
+			"min": 0,
+			"max": 240,
+			"control": {
+				"slider": true,
+				"input": true,
+				"arrows": true,
+				"slider-step": 1
+			}
+		},
+		"wave-ticks": {
+			"type": "int",
+			"name": "Wave Buffer Strength",
+			"description": "Maximum delay for Wave and Mini Wave turns. <cy>1 tick = 1/240s</c>. <cr>0 = off</c>.",
+			"default": 2,
+			"min": 0,
+			"max": 240,
+			"control": {
+				"slider": true,
+				"input": true,
+				"arrows": true,
+				"slider-step": 1
+			}
+		},
+
+		"title-spam": {
+			"type": "title",
+			"name": "Wave Spam Guard"
+		},
+		"spam-guard": {
+			"type": "bool",
+			"name": "Spam Guard",
+			"description": "Stops buffering during fast Wave spam so spam sections stay responsive. Single taps and normal turns stay fully buffered.",
+			"default": true
+		},
+		"spam-interval": {
+			"type": "int",
+			"name": "Spam Interval",
+			"description": "Inputs closer together than this many ticks count as spam.",
+			"default": 8,
+			"min": 1,
+			"max": 64,
+			"control": {
+				"input": true,
+				"arrows": true
+			}
+		},
+		"spam-streak": {
+			"type": "int",
+			"name": "Spam Streak",
+			"description": "How many rapid inputs in a row are needed before the guard kicks in.",
+			"default": 3,
+			"min": 1,
+			"max": 20,
+			"control": {
+				"input": true,
+				"arrows": true
+			}
+		},
+
+		"title-performance": {
+			"type": "title",
+			"name": "Performance"
+		},
+		"lookahead-ms": {
+			"type": "int",
+			"name": "Search Time Limit (ms)",
+			"description": "Maximum time spent searching for a good delay on one click. Lower = smoother frame rate, higher = more thorough with big buffers.",
+			"default": 5,
+			"min": 1,
+			"max": 100,
+			"control": {
+				"slider": true,
+				"input": true,
+				"arrows": true,
+				"slider-step": 1
+			}
+		},
+		"scan-stride": {
+			"type": "int",
+			"name": "Minimum Scan Step",
+			"description": "Above 16 ticks, delays are tested in steps that grow with the delay (never smaller than this). Higher = faster, slightly less precise.",
+			"default": 2,
+			"min": 1,
+			"max": 16,
+			"control": {
+				"input": true,
+				"arrows": true
+			}
+		},
+
+		"title-display": {
+			"type": "title",
+			"name": "Display & Debug"
+		},
+		"show-hud": {
+			"type": "bool",
+			"name": "Show Status Label",
+			"description": "Shows a small label with the current buffer values and how many times it saved you.",
+			"default": false
+		},
+		"hud-corner": {
+			"type": "string",
+			"name": "Label Position",
+			"description": "Which corner of the screen the status label sits in.",
+			"default": "Bottom Left",
+			"one-of": ["Bottom Left", "Bottom Right", "Top Left", "Top Right"]
+		},
+		"debug-log": {
+			"type": "bool",
+			"name": "Debug Logging",
+			"description": "Writes every save to the Geode log. Only useful for troubleshooting.",
+			"default": false
+		}
+	}
 }
