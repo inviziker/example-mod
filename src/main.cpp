@@ -6,13 +6,12 @@
 #include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
-#include <Geode/modify/PauseLayer.hpp>
 #include <cstdio>
 #include <algorithm>
 #include <string>
 
 // Windows-only: console window + F6 hotkey. Everything else (iOS, ...) uses the
-// pause-menu button and Geode's log instead.
+// Geode mod settings and Geode's log instead.
 #ifdef GEODE_IS_WINDOWS
     #include <Windows.h>
 #endif
@@ -48,6 +47,9 @@ static constexpr BufferPreset PRESETS[] = {
 };
 static constexpr int PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
+// Reused scratch buffer for the simulation's collision filter (no per-tick heap allocation).
+static gd::vector<GameObject*> s_filteredObjects;
+
 class TrajectoryBufferSim {
 private:
     PlayerObject* m_simPlayer1 = nullptr;
@@ -61,7 +63,7 @@ private:
     bool m_physicalHolding = false;
     bool m_gameHolding = false;
 
-    // Stage state (starts on Stage 0: 2 ticks Normal / 2 ticks Wave, or the last saved stage)
+    // Stage state
     int  m_presetIndex = 0;
     bool m_enabled = true;
     int  m_maxTicksNormal = 2;
@@ -162,8 +164,6 @@ public:
         m_maxTicksNormal = p.all;
         m_maxTicksWave = p.wave;
 
-        Mod::get()->setSavedValue<int>("stage-index", m_presetIndex);
-
         if (announce) {
             auto msg = presetText();
             bufLog("[InputBuffer] Cycle -> " + msg);
@@ -171,13 +171,12 @@ public:
         }
     }
 
-    // Goes to the next stage (wraps around after OFF).
+    // Windows F6: goes to the next stage by writing the Geode setting (wraps after OFF).
+    // The setting listener then applies it.
     void cyclePreset() {
-        applyPreset((m_presetIndex + 1) % PRESET_COUNT, true);
-    }
-
-    void loadSavedPreset() {
-        applyPreset(Mod::get()->getSavedValue<int>("stage-index", 0), false);
+        int next = (m_presetIndex + 1) % PRESET_COUNT;
+        Mod::get()->setSettingValue<int64_t>("stage", next + 1);
+        applyPreset(next, true);
     }
 
     std::string presetText() const {
@@ -224,46 +223,43 @@ public:
             syncSimPlayer(m_simPlayer2, realP2);
         }
 
+        // Hoisted loop-invariant checks (same conditions as before, evaluated once)
+        const bool simP2Active = isDual && m_simPlayer2;
+        const bool simP2Collide = isDual && m_simPlayer2 && realP2;
+
         // Before delayFrames, maintain the pre-input button state
         if (delayFrames > 0) {
             if (!actionPush) {
                 m_simPlayer1->pushButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
-                    m_simPlayer2->pushButton(PlayerButton::Jump);
-                }
+                if (simP2Active) m_simPlayer2->pushButton(PlayerButton::Jump);
             } else {
                 m_simPlayer1->releaseButton(PlayerButton::Jump);
-                if (isDual && m_simPlayer2) {
-                    m_simPlayer2->releaseButton(PlayerButton::Jump);
-                }
+                if (simP2Active) m_simPlayer2->releaseButton(PlayerButton::Jump);
             }
         }
 
-        float dt = getValidDt();
+        const float dt = getValidDt();
         int survived = 0;
-        bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
+        const bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
                                 (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
         int airborneTicks = 0;
         int safeLandedTicks = 0;
 
-        for (int i = 0; i < delayFrames + maxTicks; i++) {
+        const int total = delayFrames + maxTicks;
+        for (int i = 0; i < total; i++) {
             if (i == delayFrames) {
                 if (actionPush) {
                     m_simPlayer1->pushButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
-                        m_simPlayer2->pushButton(PlayerButton::Jump);
-                    }
+                    if (simP2Active) m_simPlayer2->pushButton(PlayerButton::Jump);
                 } else {
                     m_simPlayer1->releaseButton(PlayerButton::Jump);
-                    if (isDual && m_simPlayer2) {
-                        m_simPlayer2->releaseButton(PlayerButton::Jump);
-                    }
+                    if (simP2Active) m_simPlayer2->releaseButton(PlayerButton::Jump);
                 }
             }
 
             m_simPlayer1->update(dt);
             m_simPlayer1->updateRotation(dt);
-            if (isDual && m_simPlayer2) {
+            if (simP2Active) {
                 m_simPlayer2->update(dt);
                 m_simPlayer2->updateRotation(dt);
             }
@@ -273,7 +269,7 @@ public:
             pl->checkCollisions(m_simPlayer1, dt, false);
             if (m_simulationDead) break;
 
-            if (isDual && m_simPlayer2 && realP2) {
+            if (simP2Collide) {
                 resetCollisionLog(m_simPlayer2);
                 pl->checkCollisions(m_simPlayer2, dt, false);
                 if (m_simulationDead) break;
@@ -283,7 +279,7 @@ public:
                 survived++;
                 if (!isContinuousMode) {
                     bool p1Grounded = m_simPlayer1->m_isOnGround;
-                    bool p2Grounded = (!isDual || !m_simPlayer2) ? true : m_simPlayer2->m_isOnGround;
+                    bool p2Grounded = simP2Active ? m_simPlayer2->m_isOnGround : true;
                     if (!p1Grounded || !p2Grounded) {
                         airborneTicks++;
                         safeLandedTicks = 0;
@@ -418,6 +414,14 @@ public:
         int bestTicks = ticksFrame0;
 
         for (int delay = 1; delay <= maxDelayFrames; delay++) {
+            if (isWave) {
+                // EXACT early-out (no behaviour change): a simulation can never return more than
+                // targetHorizon ticks, and BOTH acceptance rules below need at least
+                // ticksFrame0 + 2*delay + 6 ticks. Once that exceeds the horizon, this delay and
+                // every larger delay is guaranteed to be rejected, so skip the expensive sims.
+                if (ticksFrame0 + (delay * 2) + 6 > targetHorizon) break;
+            }
+
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
 
             if (isWave) {
@@ -467,7 +471,7 @@ public:
 
 #ifdef GEODE_IS_WINDOWS
         // Check F6 before m_enabled check so you can always cycle back ON when it is OFF!
-        // (Other platforms cycle the stage with the button in the pause menu.)
+        // (Other platforms change the stage in the Geode mod settings.)
         if (GetAsyncKeyState(VK_F6) & 1) {
             cyclePreset();
         }
@@ -531,11 +535,18 @@ $on_mod(Loaded) {
     freopen_s(&f, "CONOUT$", "w", stdout);
     SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
 #endif
-    s_sim.loadSavedPreset();
+    s_filteredObjects.reserve(512);
+
+    // The one and only setting: the stage (1-10). Applied now and whenever it changes.
+    s_sim.applyPreset(static_cast<int>(Mod::get()->getSettingValue<int64_t>("stage")) - 1, false);
+    listenForSettingChanges<int64_t>("stage", [](int64_t value) {
+        s_sim.applyPreset(static_cast<int>(value) - 1, false);
+    });
+
     bufLog("============================================================");
     bufLog(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)");
     bufLog(" [InputBuffer] Starting Mode: " + s_sim.presetText());
-    bufLog(" [InputBuffer] Cycle stages: 2/2 4/4 8/8 16/8 24 32 48 54 60 OFF (F6 on Windows, pause-menu button elsewhere)");
+    bufLog(" [InputBuffer] Stages: 2/2 4/4 8/8 16/8 24 32 48 54 60 OFF (Geode mod settings; F6 also works on Windows)");
     bufLog("============================================================");
 }
 
@@ -671,20 +682,25 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (s_sim.isSimulating()) {
-            gd::vector<GameObject*> extra;
-            extra.reserve(objectsCount);
+            // Reuse one scratch vector instead of allocating a new one on every simulated tick.
+            s_filteredObjects.clear();
+            GameObject** data = vec->data();
             for (int i = 0; i < objectsCount; i++) {
-                GameObject* obj = vec->at(i);
+                GameObject* obj = data[i];
                 if (!obj) continue;
-                if (obj->m_objectType == GameObjectType::Solid ||
-                    obj->m_objectType == GameObjectType::Hazard ||
-                    obj->m_objectType == GameObjectType::AnimatedHazard ||
-                    obj->m_objectType == GameObjectType::CollisionObject ||
-                    obj->m_objectType == GameObjectType::Slope) {
-                    extra.push_back(obj);
+                switch (obj->m_objectType) {
+                    case GameObjectType::Solid:
+                    case GameObjectType::Hazard:
+                    case GameObjectType::AnimatedHazard:
+                    case GameObjectType::CollisionObject:
+                    case GameObjectType::Slope:
+                        s_filteredObjects.push_back(obj);
+                        break;
+                    default:
+                        break;
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
+            GJBaseGameLayer::collisionCheckObjects(player, &s_filteredObjects, static_cast<int>(s_filteredObjects.size()), dt);
             return;
         }
         GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
@@ -693,45 +709,5 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
         if (s_sim.isSimulating()) return;
         GJBaseGameLayer::playerTouchedRing(player, ring);
-    }
-};
-
-// Pause-menu button: cycles the buffer stage (this is how you change it on iOS).
-class $modify(BufPauseLayer, PauseLayer) {
-    struct Fields {
-        CCLabelBMFont* m_stageLabel = nullptr;
-    };
-
-    void customSetup() {
-        PauseLayer::customSetup();
-
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-        auto menu = CCMenu::create();
-        menu->setID("predictive-buffer-menu"_spr);
-        menu->setPosition({winSize.width - 70.f, 34.f});
-
-        auto btnSprite = ButtonSprite::create("Buffer");
-        btnSprite->setScale(0.6f);
-        auto btn = CCMenuItemSpriteExtra::create(
-            btnSprite, this, menu_selector(BufPauseLayer::onCycleStage)
-        );
-        btn->setPosition({0.f, 0.f});
-        menu->addChild(btn);
-
-        auto label = CCLabelBMFont::create(s_sim.presetText().c_str(), "chatFont.fnt");
-        label->setScale(0.6f);
-        label->setPosition({0.f, 24.f});
-        menu->addChild(label);
-        m_fields->m_stageLabel = label;
-
-        this->addChild(menu);
-    }
-
-    void onCycleStage(CCObject*) {
-        s_sim.cyclePreset();
-        if (m_fields->m_stageLabel) {
-            m_fields->m_stageLabel->setString(s_sim.presetText().c_str());
-        }
     }
 };
