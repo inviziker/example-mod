@@ -806,4 +806,3 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::playerTouchedRing(player, ring);
     }
 };
-
