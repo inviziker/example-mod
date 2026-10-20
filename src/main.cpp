@@ -6,52 +6,58 @@
 #include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
-#include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <string>
-
-// Windows-only: console window + F6 hotkey. Everything else (iOS, ...) uses the
-// Geode mod settings and Geode's log instead.
-#ifdef GEODE_IS_WINDOWS
-    #include <Windows.h>
-#endif
 
 using namespace geode::prelude;
 
 // ============================================================================
-//  USER SETTINGS
+//  Predictive Input Buffer
+//
+//  Everything is configured from the mod's settings page in Geode
+//  (see the "settings" block in mod.json). There is no in-game button or hotkey.
+//
+//  Units: 1 tick = 1/240 s. 4 ticks = 1 frame @ 60 FPS. 240 ticks = 1 second.
 // ============================================================================
 
-// True Wave Spam Guard: only bypasses the buffer if you do at least
-// SPAM_STREAK_REQUIRED consecutive inputs faster than SPAM_INTERVAL_TICKS apart.
-// This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
-constexpr int SPAM_INTERVAL_TICKS = 8;
-constexpr int SPAM_STREAK_REQUIRED = 3;
+namespace {
 
-// ============================================================================
+    // Must match "max" of normal-ticks / wave-ticks in mod.json.
+    constexpr int MAX_TICKS = 240;
 
-// One line of output: console on Windows, Geode log everywhere else.
-static void bufLog(std::string const& msg) {
-#ifdef GEODE_IS_WINDOWS
-    printf("%s\n", msg.c_str());
-#else
-    log::debug("{}", msg);
-#endif
-}
+    // Delays 1..16 are always tested one by one (see "scan-stride" for above 16).
+    constexpr int FULL_SCAN_LIMIT = 16;
 
-// Stage table: {ticks for all modes, ticks for wave}. {0, 0} == OFF.
-// (4 ticks = 1 frame @ 60fps)
-struct BufferPreset { int all; int wave; };
-static constexpr BufferPreset PRESETS[] = {
-    {2, 2}, {4, 4}, {8, 8}, {16, 8}, {24, 24}, {32, 32}, {48, 48}, {54, 54}, {60, 60}, {0, 0}
-};
-static constexpr int PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
+    // Very long buffers need a longer lookahead, but it is capped so the cost of a
+    // single simulation stays reasonable.
+    constexpr int MAX_HORIZON_EXTRA = 64;
 
-// Reused scratch buffer for the simulation's collision filter (no per-tick heap allocation).
-static gd::vector<GameObject*> s_filteredObjects;
+    using Clock = std::chrono::steady_clock;
+
+    // Snapshot of all settings (re-read on every click, so changes apply immediately).
+    struct Config {
+        bool enabled = true;
+        int normalTicks = 2;
+        int waveTicks = 2;
+
+        bool spamGuard = true;
+        int spamInterval = 8;
+        int spamStreak = 3;
+
+        int lookaheadMs = 5;
+        int scanStride = 2;
+
+        bool showHud = false;
+        std::string hudCorner = "Bottom Left";
+        bool debugLog = false;
+    };
+
+} // namespace
 
 class TrajectoryBufferSim {
 private:
+    // --- simulation players (invisible copies of the real players) ---
     PlayerObject* m_simPlayer1 = nullptr;
     PlayerObject* m_simPlayer2 = nullptr;
 
@@ -59,25 +65,29 @@ private:
     bool m_firingBuffered = false;
     bool m_simulationDead = false;
 
-    // Tracks actual physical mouse state vs what PlayLayer currently has active
+    // Real physical button state vs. what the game currently has active
     bool m_physicalHolding = false;
     bool m_gameHolding = false;
 
-    // Stage state
-    int  m_presetIndex = 0;
+    // --- settings ---
+    Config m_cfg;
     bool m_enabled = true;
-    int  m_maxTicksNormal = 2;
-    int  m_maxTicksWave = 2;
 
-    // Buffer state
+    // --- buffer state ---
     int  m_waitTicks = -1;          // -1 = inactive, >= 0 = countdown ticks, -2 = queued opposite tick
     bool m_bufferedPush = true;     // true = buffered PRESS, false = buffered RELEASE
-    bool m_queuedOpposite = false;  // true if user quickly released/re-pressed during wait
+    bool m_queuedOpposite = false;  // true if the user quickly released/re-pressed during the wait
     float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
 
-    // Streak-based Spam Guard state
+    // --- streak-based wave spam guard ---
     int  m_ticksSinceLastInput = 999;
     int  m_rapidInputStreak = 0;
+
+    // --- optional on-screen status label ---
+    CCLabelBMFont* m_hud = nullptr;
+    std::string m_hudText;
+    std::string m_hudCorner;
+    int m_saves = 0;
 
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
@@ -120,10 +130,109 @@ private:
         return 0.25f;
     }
 
+    // ------------------------------------------------------------------
+    //  HUD
+    // ------------------------------------------------------------------
+
+    static std::string tickText(int ticks) {
+        return ticks > 0 ? fmt::format("{}", ticks) : std::string("off");
+    }
+
+    std::string hudString() const {
+        if (!m_enabled) return "Buffer: OFF";
+        return fmt::format("Buffer {} / {} | Saves {}",
+            tickText(m_cfg.normalTicks), tickText(m_cfg.waveTicks), m_saves);
+    }
+
+    void layoutHud() {
+        auto win = CCDirector::sharedDirector()->getWinSize();
+        const float margin = 6.f;
+        bool right = m_cfg.hudCorner.find("Right") != std::string::npos;
+        bool top = m_cfg.hudCorner.find("Top") != std::string::npos;
+        m_hud->setAnchorPoint({right ? 1.f : 0.f, top ? 1.f : 0.f});
+        m_hud->setPosition({
+            right ? win.width - margin : margin,
+            top ? win.height - margin : margin
+        });
+    }
+
+    void syncHud() {
+        PlayLayer* pl = PlayLayer::get();
+        if (!pl) return;
+
+        if (!m_cfg.showHud) {
+            if (m_hud) m_hud->setVisible(false);
+            return;
+        }
+
+        if (!m_hud) {
+            m_hud = CCLabelBMFont::create("", "chatFont.fnt");
+            m_hud->retain();
+            m_hud->setScale(0.55f);
+            m_hud->setOpacity(170);
+            pl->addChild(m_hud, 1000);
+            m_hudText.clear();
+            m_hudCorner.clear();
+        }
+        m_hud->setVisible(true);
+
+        if (m_hudCorner != m_cfg.hudCorner) {
+            layoutHud();
+            m_hudCorner = m_cfg.hudCorner;
+        }
+
+        // Only touch the label when its text actually changes.
+        auto text = hudString();
+        if (text != m_hudText) {
+            m_hud->setString(text.c_str());
+            m_hudText = text;
+        }
+    }
+
 public:
+    // ------------------------------------------------------------------
+    //  Settings
+    // ------------------------------------------------------------------
+
+    void refreshConfig() {
+        auto mod = Mod::get();
+        auto readInt = [&](char const* key, int lo, int hi) {
+            return std::clamp(static_cast<int>(mod->getSettingValue<int64_t>(key)), lo, hi);
+        };
+
+        Config c;
+        c.enabled = mod->getSettingValue<bool>("enabled");
+        c.normalTicks = readInt("normal-ticks", 0, MAX_TICKS);
+        c.waveTicks = readInt("wave-ticks", 0, MAX_TICKS);
+        c.spamGuard = mod->getSettingValue<bool>("spam-guard");
+        c.spamInterval = readInt("spam-interval", 1, 64);
+        c.spamStreak = readInt("spam-streak", 1, 20);
+        c.lookaheadMs = readInt("lookahead-ms", 1, 100);
+        c.scanStride = readInt("scan-stride", 1, 16);
+        c.showHud = mod->getSettingValue<bool>("show-hud");
+        c.hudCorner = mod->getSettingValue<std::string>("hud-corner");
+        c.debugLog = mod->getSettingValue<bool>("debug-log");
+        m_cfg = c;
+
+        bool wasEnabled = m_enabled;
+        m_enabled = m_cfg.enabled && (m_cfg.normalTicks > 0 || m_cfg.waveTicks > 0);
+        if (wasEnabled && !m_enabled) {
+            m_waitTicks = -1;
+            m_queuedOpposite = false;
+        }
+
+        syncHud();
+    }
+
+    // ------------------------------------------------------------------
+    //  Level lifecycle
+    // ------------------------------------------------------------------
+
     void init() {
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return;
+
+        quit(); // drop anything left over from a previous level
 
         m_simPlayer1 = createTrajectoryPlayer();
         m_simPlayer2 = createTrajectoryPlayer();
@@ -135,6 +244,9 @@ public:
         m_firingBuffered = false;
         m_ticksSinceLastInput = 999;
         m_rapidInputStreak = 0;
+        m_saves = 0;
+
+        refreshConfig();
     }
 
     void quit() {
@@ -146,45 +258,17 @@ public:
             m_simPlayer2->release();
             m_simPlayer2 = nullptr;
         }
+        if (m_hud) {
+            m_hud->release();
+            m_hud = nullptr;
+        }
+        m_hudText.clear();
+        m_hudCorner.clear();
         m_simulating = false;
         m_firingBuffered = false;
         m_waitTicks = -1;
         m_queuedOpposite = false;
         m_rapidInputStreak = 0;
-    }
-
-    // Applies stage `idx` of PRESETS (clamped) and optionally announces it.
-    void applyPreset(int idx, bool announce) {
-        m_presetIndex = std::clamp(idx, 0, PRESET_COUNT - 1);
-        m_waitTicks = -1;
-        m_queuedOpposite = false;
-
-        auto const& p = PRESETS[m_presetIndex];
-        m_enabled = (p.all != 0 || p.wave != 0);
-        m_maxTicksNormal = p.all;
-        m_maxTicksWave = p.wave;
-
-        if (announce) {
-            auto msg = presetText();
-            bufLog("[InputBuffer] Cycle -> " + msg);
-            Notification::create(msg, NotificationIcon::None, 1.f)->show();
-        }
-    }
-
-    // Windows F6: goes to the next stage by writing the Geode setting (wraps after OFF).
-    // The setting listener then applies it.
-    void cyclePreset() {
-        int next = (m_presetIndex + 1) % PRESET_COUNT;
-        Mod::get()->setSettingValue<int64_t>("stage", next + 1);
-        applyPreset(next, true);
-    }
-
-    std::string presetText() const {
-        auto const& p = PRESETS[m_presetIndex];
-        if (!m_enabled) {
-            return fmt::format("STAGE {}: OFF (100% Raw Input)", m_presetIndex + 1);
-        }
-        return fmt::format("STAGE {}: {} Ticks All | {} Ticks Wave", m_presetIndex + 1, p.all, p.wave);
     }
 
     bool isSimulating() const { return m_simulating; }
@@ -212,54 +296,59 @@ public:
         }
     }
 
+    // ------------------------------------------------------------------
+    //  Trajectory simulation
+    // ------------------------------------------------------------------
+
+    // Simulates "press/release after `delayFrames` ticks" and returns how many ticks
+    // (up to maxTicks) the player survives afterwards.
     int getSurvivalTicks(PlayLayer* pl, PlayerObject* realP1, PlayerObject* realP2, bool isDual, int delayFrames, bool actionPush, int maxTicks) {
         if (!pl || !m_simPlayer1 || !realP1) return maxTicks;
+
+        // Second sim player is only used when the real player 2 exists in Dual mode.
+        const bool dual2 = isDual && m_simPlayer2 && realP2;
 
         m_simulating = true;
         m_simulationDead = false;
 
         syncSimPlayer(m_simPlayer1, realP1);
-        if (isDual && m_simPlayer2 && realP2) {
+        if (dual2) {
             syncSimPlayer(m_simPlayer2, realP2);
         }
-
-        // Hoisted loop-invariant checks (same conditions as before, evaluated once)
-        const bool simP2Active = isDual && m_simPlayer2;
-        const bool simP2Collide = isDual && m_simPlayer2 && realP2;
 
         // Before delayFrames, maintain the pre-input button state
         if (delayFrames > 0) {
             if (!actionPush) {
                 m_simPlayer1->pushButton(PlayerButton::Jump);
-                if (simP2Active) m_simPlayer2->pushButton(PlayerButton::Jump);
+                if (dual2) m_simPlayer2->pushButton(PlayerButton::Jump);
             } else {
                 m_simPlayer1->releaseButton(PlayerButton::Jump);
-                if (simP2Active) m_simPlayer2->releaseButton(PlayerButton::Jump);
+                if (dual2) m_simPlayer2->releaseButton(PlayerButton::Jump);
             }
         }
 
         const float dt = getValidDt();
         int survived = 0;
         const bool isContinuousMode = realP1->m_isDart || realP1->m_isBird || realP1->m_isSwing ||
-                                (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
+                                      (isDual && realP2 && (realP2->m_isDart || realP2->m_isBird || realP2->m_isSwing));
         int airborneTicks = 0;
         int safeLandedTicks = 0;
 
-        const int total = delayFrames + maxTicks;
-        for (int i = 0; i < total; i++) {
+        const int totalSteps = delayFrames + maxTicks;
+        for (int i = 0; i < totalSteps; i++) {
             if (i == delayFrames) {
                 if (actionPush) {
                     m_simPlayer1->pushButton(PlayerButton::Jump);
-                    if (simP2Active) m_simPlayer2->pushButton(PlayerButton::Jump);
+                    if (dual2) m_simPlayer2->pushButton(PlayerButton::Jump);
                 } else {
                     m_simPlayer1->releaseButton(PlayerButton::Jump);
-                    if (simP2Active) m_simPlayer2->releaseButton(PlayerButton::Jump);
+                    if (dual2) m_simPlayer2->releaseButton(PlayerButton::Jump);
                 }
             }
 
             m_simPlayer1->update(dt);
             m_simPlayer1->updateRotation(dt);
-            if (simP2Active) {
+            if (dual2) {
                 m_simPlayer2->update(dt);
                 m_simPlayer2->updateRotation(dt);
             }
@@ -269,7 +358,7 @@ public:
             pl->checkCollisions(m_simPlayer1, dt, false);
             if (m_simulationDead) break;
 
-            if (simP2Collide) {
+            if (dual2) {
                 resetCollisionLog(m_simPlayer2);
                 pl->checkCollisions(m_simPlayer2, dt, false);
                 if (m_simulationDead) break;
@@ -279,7 +368,7 @@ public:
                 survived++;
                 if (!isContinuousMode) {
                     bool p1Grounded = m_simPlayer1->m_isOnGround;
-                    bool p2Grounded = simP2Active ? m_simPlayer2->m_isOnGround : true;
+                    bool p2Grounded = dual2 ? m_simPlayer2->m_isOnGround : true;
                     if (!p1Grounded || !p2Grounded) {
                         airborneTicks++;
                         safeLandedTicks = 0;
@@ -298,6 +387,12 @@ public:
         return survived;
     }
 
+    // ------------------------------------------------------------------
+    //  Input handling
+    // ------------------------------------------------------------------
+
+    // Returns true if the input should reach the game now, false if it was
+    // captured by the buffer (and will be fired later).
     bool interceptInput(GJBaseGameLayer* layer, bool push, bool isPlayer1) {
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return true;
@@ -313,7 +408,10 @@ public:
             return true;
         }
 
-        // Always record the user's true physical mouse/key state first!
+        // Pick up any settings changes (cheap).
+        refreshConfig();
+
+        // Always record the user's true physical button state first!
         m_physicalHolding = push;
 
         if (!m_enabled) {
@@ -339,13 +437,9 @@ public:
         }
 
         // 2. If an input is currently waiting in the buffer and the user quickly releases
-        // (or re-presses) 1-2 ticks later, queue it for the next tick so fast taps are never eaten
+        // (or re-presses) a moment later, queue it for the next tick so fast taps are never eaten
         if (m_waitTicks >= 0) {
-            if (push != m_bufferedPush) {
-                m_queuedOpposite = true;
-            } else {
-                m_queuedOpposite = false;
-            }
+            m_queuedOpposite = (push != m_bufferedPush);
             m_ticksSinceLastInput = 0;
             return false;
         }
@@ -365,16 +459,17 @@ public:
                           (isDual && p2 && p2->m_isDart && p2->m_vehicleSize < 1.0f);
 
         // 3. STREAK-BASED WAVE SPAM GUARD:
-        // Only bypasses if you perform 3+ rapid inputs in a row (< 8 ticks apart).
-        // Single micro-clicks and normal Wave turns around spikes/sawblades stay 100% active!
-        if (m_ticksSinceLastInput < SPAM_INTERVAL_TICKS) {
+        // Only bypasses if you perform several rapid inputs in a row (closer together than
+        // "spam-interval" ticks). Single micro-clicks and normal Wave turns around
+        // spikes/sawblades stay 100% protected!
+        if (m_cfg.spamGuard && m_ticksSinceLastInput < m_cfg.spamInterval) {
             m_rapidInputStreak++;
         } else {
             m_rapidInputStreak = 0;
         }
         m_ticksSinceLastInput = 0;
 
-        if (isWave && m_rapidInputStreak >= SPAM_STREAK_REQUIRED) {
+        if (isWave && m_cfg.spamGuard && m_rapidInputStreak >= m_cfg.spamStreak) {
             m_gameHolding = push;
             return true;
         }
@@ -388,17 +483,22 @@ public:
         }
 
         m_queuedOpposite = false;
-        const char* act = push ? "PRESS" : "RELEASE";
+
+        // Buffer strength for the current mode. 0 = off for this mode.
+        int maxDelayFrames = isWave ? m_cfg.waveTicks : m_cfg.normalTicks;
+        if (maxDelayFrames <= 0) {
+            m_gameHolding = push;
+            return true;
+        }
 
         // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
         // so it sees spikes and sawblades 1-3 blocks ahead along the diagonal path!
         int targetHorizon = isMiniWave ? 50 : (isWave ? 65 : 160);
-        int maxDelayFrames = isWave ? m_maxTicksWave : m_maxTicksNormal;
 
-        // Extended stages (limits above the original 16-tick maximum) need a longer
-        // lookahead so the delayed trajectory is still checked far enough ahead.
-        if (maxDelayFrames > 16) {
-            targetHorizon += maxDelayFrames - 16;
+        // Long buffers (above the original 16-tick maximum) need a longer lookahead so the
+        // delayed trajectory is still checked far enough ahead.
+        if (maxDelayFrames > FULL_SCAN_LIMIT) {
+            targetHorizon += std::min(maxDelayFrames - FULL_SCAN_LIMIT, MAX_HORIZON_EXTRA);
         }
 
         // 4. Check Frame 0 (immediate input) across the full trajectory horizon
@@ -408,20 +508,32 @@ public:
             return true;
         }
 
+        // Last delay worth testing.
+        int scanLimit = maxDelayFrames;
+        if (isWave) {
+            // EXACT shortcut (does not change results): a Wave delay is only accepted if it gains at
+            // least (2 * delay + 6) ticks over Frame 0, and a simulation can never survive more than
+            // targetHorizon ticks. So any larger delay can never be accepted -- skip simulating them.
+            scanLimit = std::min(scanLimit, (targetHorizon - ticksFrame0 - 6) / 2);
+        }
+
+        // Delays 1..16 are tested one by one; above that every "scan-stride"-th delay is tested
+        // (every 2x stride beyond 64 ticks).
+        auto nextStep = [&](int delay) {
+            if (delay < FULL_SCAN_LIMIT) return 1;
+            return delay < 64 ? m_cfg.scanStride : m_cfg.scanStride * 2;
+        };
+
+        // Time limit for the delay search: keeps the frame rate steady. The first candidate
+        // is always tested, then the search stops once the time is up.
+        const auto deadline = Clock::now() + std::chrono::milliseconds(m_cfg.lookaheadMs);
+
         // 5. Frame 0 hits a spike, sawblade, or slope within the horizon!
-        // Scan +1..maxDelayFrames for the earliest delay that genuinely clears the obstacle.
+        // Scan upwards for the earliest delay that genuinely clears the obstacle.
         int bestDelay = 0;
         int bestTicks = ticksFrame0;
 
-        for (int delay = 1; delay <= maxDelayFrames; delay++) {
-            if (isWave) {
-                // EXACT early-out (no behaviour change): a simulation can never return more than
-                // targetHorizon ticks, and BOTH acceptance rules below need at least
-                // ticksFrame0 + 2*delay + 6 ticks. Once that exceeds the horizon, this delay and
-                // every larger delay is guaranteed to be rejected, so skip the expensive sims.
-                if (ticksFrame0 + (delay * 2) + 6 > targetHorizon) break;
-            }
-
+        for (int delay = 1; delay <= scanLimit; delay += nextStep(delay)) {
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
 
             if (isWave) {
@@ -451,11 +563,17 @@ public:
                     bestTicks = ticks;
                 }
             }
+
+            if (Clock::now() >= deadline) break;
         }
 
         if (bestDelay > 0) {
-            bufLog(fmt::format("[InputBuffer] *** SAVED +{} TICKS ({:.2f} frames @ 60fps) {}! (Frame0: {} -> Delayed: {}) [Limit: {}] ***",
-                bestDelay, bestDelay / 4.0f, act, ticksFrame0, bestTicks, maxDelayFrames));
+            m_saves++;
+            if (m_cfg.debugLog) {
+                log::debug("[InputBuffer] SAVED +{} ticks ({:.2f} frames @ 60fps) {} (Frame0: {} -> Delayed: {}) [Limit: {}]",
+                    bestDelay, bestDelay / 4.0f, push ? "PRESS" : "RELEASE", ticksFrame0, bestTicks, maxDelayFrames);
+            }
+            syncHud();
             m_bufferedPush = push;
             m_waitTicks = bestDelay;
             return false;
@@ -465,17 +583,10 @@ public:
         return true;
     }
 
+    // Called on every player update tick.
     void onPlayerUpdate(PlayerObject* player) {
         PlayLayer* pl = PlayLayer::get();
         if (!pl || player != pl->m_player1) return;
-
-#ifdef GEODE_IS_WINDOWS
-        // Check F6 before m_enabled check so you can always cycle back ON when it is OFF!
-        // (Other platforms change the stage in the Geode mod settings.)
-        if (GetAsyncKeyState(VK_F6) & 1) {
-            cyclePreset();
-        }
-#endif
 
         if (!m_enabled) return;
 
@@ -508,7 +619,7 @@ public:
             m_waitTicks = -1;
         } else if (m_waitTicks == -1) {
             // FAILSAFE: When no buffer is active, guarantee the game's hold state
-            // matches your actual physical mouse button so Wave/Mini Wave can NEVER stay stuck holding!
+            // matches your actual physical button so Wave/Mini Wave can NEVER stay stuck holding!
             if (m_gameHolding != m_physicalHolding) {
                 m_SimFireButton(pl, m_physicalHolding);
             }
@@ -529,26 +640,12 @@ public:
 static TrajectoryBufferSim s_sim;
 
 $on_mod(Loaded) {
-#ifdef GEODE_IS_WINDOWS
-    AllocConsole();
-    FILE* f;
-    freopen_s(&f, "CONOUT$", "w", stdout);
-    SetConsoleTitleA("Geode Predictive Input Buffer - Live Console");
-#endif
-    s_filteredObjects.reserve(512);
-
-    // The one and only setting: the stage (1-10). Applied now and whenever it changes.
-    s_sim.applyPreset(static_cast<int>(Mod::get()->getSettingValue<int64_t>("stage")) - 1, false);
-    listenForSettingChanges<int64_t>("stage", [](int64_t value) {
-        s_sim.applyPreset(static_cast<int>(value) - 1, false);
-    });
-
-    bufLog("============================================================");
-    bufLog(" [InputBuffer] v4.6 LOADED (Wave Spikes/Saws Trajectory Fix)");
-    bufLog(" [InputBuffer] Starting Mode: " + s_sim.presetText());
-    bufLog(" [InputBuffer] Stages: 2/2 4/4 8/8 16/8 24 32 48 54 60 OFF (Geode mod settings; F6 also works on Windows)");
-    bufLog("============================================================");
+    log::info("[InputBuffer] v5.0 loaded - configure it in the mod's settings");
 }
+
+// ============================================================================
+//  Hooks
+// ============================================================================
 
 class $modify(BufPlayLayer, PlayLayer) {
     static void onModify(auto& self) {
@@ -682,25 +779,23 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (s_sim.isSimulating()) {
-            // Reuse one scratch vector instead of allocating a new one on every simulated tick.
-            s_filteredObjects.clear();
-            GameObject** data = vec->data();
+            // This runs once per simulated tick (thousands of times per click), so the filtered
+            // list is kept in one reusable buffer instead of allocating a new vector every call.
+            static gd::vector<GameObject*> s_filtered;
+            s_filtered.clear();
+            s_filtered.reserve(objectsCount);
             for (int i = 0; i < objectsCount; i++) {
-                GameObject* obj = data[i];
+                GameObject* obj = vec->at(i);
                 if (!obj) continue;
-                switch (obj->m_objectType) {
-                    case GameObjectType::Solid:
-                    case GameObjectType::Hazard:
-                    case GameObjectType::AnimatedHazard:
-                    case GameObjectType::CollisionObject:
-                    case GameObjectType::Slope:
-                        s_filteredObjects.push_back(obj);
-                        break;
-                    default:
-                        break;
+                if (obj->m_objectType == GameObjectType::Solid ||
+                    obj->m_objectType == GameObjectType::Hazard ||
+                    obj->m_objectType == GameObjectType::AnimatedHazard ||
+                    obj->m_objectType == GameObjectType::CollisionObject ||
+                    obj->m_objectType == GameObjectType::Slope) {
+                    s_filtered.push_back(obj);
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &s_filteredObjects, static_cast<int>(s_filteredObjects.size()), dt);
+            GJBaseGameLayer::collisionCheckObjects(player, &s_filtered, static_cast<int>(s_filtered.size()), dt);
             return;
         }
         GJBaseGameLayer::collisionCheckObjects(player, vec, objectsCount, dt);
