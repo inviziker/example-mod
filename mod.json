@@ -1,12 +1,29 @@
 {
-        "geode": "5.11.2",
-        "gd": {
-                "win": "2.2081",
-  "android": "2.2081"
-        },
-        "version": "v1.1.0",
-        "id": "ai.predictivebuffer",
-        "name": "Predictive Input Buffer",
-        "developer": "lilWC",
-        "description": "Trajectory-based 1-2 frame press and wave release input buffer."
+    "geode": "5.11.2",
+    "gd": {
+        "win": "2.2081",
+        "android": "2.2081"
+    },
+    "version": "v1.1.0",
+    "id": "ai.predictivebuffer",
+    "name": "Predictive Input Buffer",
+    "developer": "lilWC",
+    "description": "Trajectory-based 1-2 frame press and wave release input buffer.",
+    "settings": {
+        "stage": {
+            "type": "int",
+            "name": "Buffer Stage",
+            "description": "Buffer strength, in ticks (4 ticks = 1 frame at 60 FPS), as all modes / wave:\n1: 2 / 2\n2: 4 / 4\n3: 8 / 8\n4: 16 / 8\n5: 24 / 24\n6: 32 / 32\n7: 48 / 48\n8: 54 / 54\n9: 60 / 60\n10: OFF",
+            "default": 1,
+            "min": 1,
+            "max": 10,
+            "control": {
+                "slider": true,
+                "slider-step": 1,
+                "input": true,
+                "arrows": true,
+                "arrow-step": 1
+            }
+        }
+    }
 }
