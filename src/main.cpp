@@ -7,57 +7,44 @@
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <algorithm>
-#include <chrono>
-#include <string>
 
 using namespace geode::prelude;
 
 // ============================================================================
 //  Predictive Input Buffer
 //
-//  Everything is configured from the mod's settings page in Geode
-//  (see the "settings" block in mod.json). There is no in-game button or hotkey.
-//
-//  Units: 1 tick = 1/240 s. 4 ticks = 1 frame @ 60 FPS. 240 ticks = 1 second.
+//  The buffer stage is chosen in the mod's settings page in Geode ("Buffer Stage").
+//  (4 ticks = 1 frame @ 60 FPS)
 // ============================================================================
 
-namespace {
+// ============================================================================
+//  USER SETTINGS
+// ============================================================================
 
-    // Must match "max" of normal-ticks / wave-ticks in mod.json.
-    constexpr int MAX_TICKS = 240;
+// True Wave Spam Guard: only bypasses the buffer if you do at least
+// SPAM_STREAK_REQUIRED consecutive inputs faster than SPAM_INTERVAL_TICKS apart.
+// This keeps isolated micro-clicks and spike/sawblade dodges 100% protected!
+constexpr int SPAM_INTERVAL_TICKS = 8;
+constexpr int SPAM_STREAK_REQUIRED = 3;
 
-    // Delays 1..16 are always tested one by one (see "scan-stride" for above 16).
-    constexpr int FULL_SCAN_LIMIT = 16;
+// Performance: hard cap on simulated physics steps per click/release. Keeps the
+// frame rate steady on phones when a high stage is selected.
+constexpr int MAX_SIM_STEPS_PER_INPUT = 3000;
 
-    // Very long buffers need a longer lookahead, but it is capped so the cost of a
-    // single simulation stays reasonable.
-    constexpr int MAX_HORIZON_EXTRA = 64;
+// For delays above 16 ticks (stages 6-9), test every Nth delay instead of every one.
+constexpr int LARGE_DELAY_STRIDE = 2;
 
-    using Clock = std::chrono::steady_clock;
+// ============================================================================
 
-    // Snapshot of all settings (re-read on every click, so changes apply immediately).
-    struct Config {
-        bool enabled = true;
-        int normalTicks = 2;
-        int waveTicks = 2;
-
-        bool spamGuard = true;
-        int spamInterval = 8;
-        int spamStreak = 3;
-
-        int lookaheadMs = 5;
-        int scanStride = 2;
-
-        bool showHud = false;
-        std::string hudCorner = "Bottom Left";
-        bool debugLog = false;
-    };
-
-} // namespace
+// Stage table: {ticks for all modes, ticks for wave}. {0, 0} == OFF.
+struct BufferPreset { int all; int wave; };
+static constexpr BufferPreset PRESETS[] = {
+    {2, 2}, {4, 4}, {8, 8}, {16, 8}, {24, 24}, {32, 32}, {48, 48}, {54, 54}, {60, 60}, {0, 0}
+};
+static constexpr int PRESET_COUNT = sizeof(PRESETS) / sizeof(PRESETS[0]);
 
 class TrajectoryBufferSim {
 private:
-    // --- simulation players (invisible copies of the real players) ---
     PlayerObject* m_simPlayer1 = nullptr;
     PlayerObject* m_simPlayer2 = nullptr;
 
@@ -65,29 +52,28 @@ private:
     bool m_firingBuffered = false;
     bool m_simulationDead = false;
 
-    // Real physical button state vs. what the game currently has active
+    // Tracks actual physical button state vs what PlayLayer currently has active
     bool m_physicalHolding = false;
     bool m_gameHolding = false;
 
-    // --- settings ---
-    Config m_cfg;
+    // Stage state (-1 = not read from settings yet)
+    int  m_presetIndex = -1;
     bool m_enabled = true;
+    int  m_maxTicksNormal = 2;
+    int  m_maxTicksWave = 2;
 
-    // --- buffer state ---
+    // Buffer state
     int  m_waitTicks = -1;          // -1 = inactive, >= 0 = countdown ticks, -2 = queued opposite tick
     bool m_bufferedPush = true;     // true = buffered PRESS, false = buffered RELEASE
-    bool m_queuedOpposite = false;  // true if the user quickly released/re-pressed during the wait
+    bool m_queuedOpposite = false;  // true if user quickly released/re-pressed during wait
     float m_frameDt = 0.25f;        // GD 240 TPS normalized dt is 0.25f
 
-    // --- streak-based wave spam guard ---
+    // Streak-based Spam Guard state
     int  m_ticksSinceLastInput = 999;
     int  m_rapidInputStreak = 0;
 
-    // --- optional on-screen status label ---
-    CCLabelBMFont* m_hud = nullptr;
-    std::string m_hudText;
-    std::string m_hudCorner;
-    int m_saves = 0;
+    // Simulation work counter for the current input (see MAX_SIM_STEPS_PER_INPUT)
+    int  m_stepsUsed = 0;
 
     PlayerObject* createTrajectoryPlayer() {
         PlayLayer* pl = PlayLayer::get();
@@ -130,103 +116,27 @@ private:
         return 0.25f;
     }
 
-    // ------------------------------------------------------------------
-    //  HUD
-    // ------------------------------------------------------------------
+    // Applies stage `idx` of PRESETS (clamped).
+    void applyPreset(int idx) {
+        m_presetIndex = std::clamp(idx, 0, PRESET_COUNT - 1);
+        m_waitTicks = -1;
+        m_queuedOpposite = false;
 
-    static std::string tickText(int ticks) {
-        return ticks > 0 ? fmt::format("{}", ticks) : std::string("off");
-    }
-
-    std::string hudString() const {
-        if (!m_enabled) return "Buffer: OFF";
-        return fmt::format("Buffer {} / {} | Saves {}",
-            tickText(m_cfg.normalTicks), tickText(m_cfg.waveTicks), m_saves);
-    }
-
-    void layoutHud() {
-        auto win = CCDirector::sharedDirector()->getWinSize();
-        const float margin = 6.f;
-        bool right = m_cfg.hudCorner.find("Right") != std::string::npos;
-        bool top = m_cfg.hudCorner.find("Top") != std::string::npos;
-        m_hud->setAnchorPoint({right ? 1.f : 0.f, top ? 1.f : 0.f});
-        m_hud->setPosition({
-            right ? win.width - margin : margin,
-            top ? win.height - margin : margin
-        });
-    }
-
-    void syncHud() {
-        PlayLayer* pl = PlayLayer::get();
-        if (!pl) return;
-
-        if (!m_cfg.showHud) {
-            if (m_hud) m_hud->setVisible(false);
-            return;
-        }
-
-        if (!m_hud) {
-            m_hud = CCLabelBMFont::create("", "chatFont.fnt");
-            m_hud->retain();
-            m_hud->setScale(0.55f);
-            m_hud->setOpacity(170);
-            pl->addChild(m_hud, 1000);
-            m_hudText.clear();
-            m_hudCorner.clear();
-        }
-        m_hud->setVisible(true);
-
-        if (m_hudCorner != m_cfg.hudCorner) {
-            layoutHud();
-            m_hudCorner = m_cfg.hudCorner;
-        }
-
-        // Only touch the label when its text actually changes.
-        auto text = hudString();
-        if (text != m_hudText) {
-            m_hud->setString(text.c_str());
-            m_hudText = text;
-        }
+        auto const& p = PRESETS[m_presetIndex];
+        m_enabled = (p.all != 0 || p.wave != 0);
+        m_maxTicksNormal = p.all;
+        m_maxTicksWave = p.wave;
     }
 
 public:
-    // ------------------------------------------------------------------
-    //  Settings
-    // ------------------------------------------------------------------
-
-    void refreshConfig() {
-        auto mod = Mod::get();
-        auto readInt = [&](char const* key, int lo, int hi) {
-            return std::clamp(static_cast<int>(mod->getSettingValue<int64_t>(key)), lo, hi);
-        };
-
-        Config c;
-        c.enabled = mod->getSettingValue<bool>("enabled");
-        c.normalTicks = readInt("normal-ticks", 0, MAX_TICKS);
-        c.waveTicks = readInt("wave-ticks", 0, MAX_TICKS);
-        c.spamGuard = mod->getSettingValue<bool>("spam-guard");
-        c.spamInterval = readInt("spam-interval", 1, 64);
-        c.spamStreak = readInt("spam-streak", 1, 20);
-        c.lookaheadMs = readInt("lookahead-ms", 1, 100);
-        c.scanStride = readInt("scan-stride", 1, 16);
-        c.showHud = mod->getSettingValue<bool>("show-hud");
-        c.hudCorner = mod->getSettingValue<std::string>("hud-corner");
-        c.debugLog = mod->getSettingValue<bool>("debug-log");
-        m_cfg = c;
-
-        bool wasEnabled = m_enabled;
-        m_enabled = m_cfg.enabled && (m_cfg.normalTicks > 0 || m_cfg.waveTicks > 0);
-        if (wasEnabled && !m_enabled) {
-            m_waitTicks = -1;
-            m_queuedOpposite = false;
+    // Reads the "stage" setting (1-10) and applies it if it changed.
+    void refreshStage() {
+        int stage = static_cast<int>(Mod::get()->getSettingValue<int64_t>("stage"));
+        int idx = std::clamp(stage - 1, 0, PRESET_COUNT - 1);
+        if (idx != m_presetIndex) {
+            applyPreset(idx);
         }
-
-        syncHud();
     }
-
-    // ------------------------------------------------------------------
-    //  Level lifecycle
-    // ------------------------------------------------------------------
 
     void init() {
         PlayLayer* pl = PlayLayer::get();
@@ -244,9 +154,9 @@ public:
         m_firingBuffered = false;
         m_ticksSinceLastInput = 999;
         m_rapidInputStreak = 0;
-        m_saves = 0;
+        m_stepsUsed = 0;
 
-        refreshConfig();
+        refreshStage();
     }
 
     void quit() {
@@ -258,12 +168,6 @@ public:
             m_simPlayer2->release();
             m_simPlayer2 = nullptr;
         }
-        if (m_hud) {
-            m_hud->release();
-            m_hud = nullptr;
-        }
-        m_hudText.clear();
-        m_hudCorner.clear();
         m_simulating = false;
         m_firingBuffered = false;
         m_waitTicks = -1;
@@ -296,10 +200,6 @@ public:
         }
     }
 
-    // ------------------------------------------------------------------
-    //  Trajectory simulation
-    // ------------------------------------------------------------------
-
     // Simulates "press/release after `delayFrames` ticks" and returns how many ticks
     // (up to maxTicks) the player survives afterwards.
     int getSurvivalTicks(PlayLayer* pl, PlayerObject* realP1, PlayerObject* realP2, bool isDual, int delayFrames, bool actionPush, int maxTicks) {
@@ -307,6 +207,7 @@ public:
 
         // Second sim player is only used when the real player 2 exists in Dual mode.
         const bool dual2 = isDual && m_simPlayer2 && realP2;
+        const int stepCost = dual2 ? 2 : 1;
 
         m_simulating = true;
         m_simulationDead = false;
@@ -345,6 +246,8 @@ public:
                     if (dual2) m_simPlayer2->releaseButton(PlayerButton::Jump);
                 }
             }
+
+            m_stepsUsed += stepCost;
 
             m_simPlayer1->update(dt);
             m_simPlayer1->updateRotation(dt);
@@ -387,10 +290,6 @@ public:
         return survived;
     }
 
-    // ------------------------------------------------------------------
-    //  Input handling
-    // ------------------------------------------------------------------
-
     // Returns true if the input should reach the game now, false if it was
     // captured by the buffer (and will be fired later).
     bool interceptInput(GJBaseGameLayer* layer, bool push, bool isPlayer1) {
@@ -408,8 +307,8 @@ public:
             return true;
         }
 
-        // Pick up any settings changes (cheap).
-        refreshConfig();
+        // Pick up a changed stage from the settings (cheap).
+        refreshStage();
 
         // Always record the user's true physical button state first!
         m_physicalHolding = push;
@@ -437,7 +336,7 @@ public:
         }
 
         // 2. If an input is currently waiting in the buffer and the user quickly releases
-        // (or re-presses) a moment later, queue it for the next tick so fast taps are never eaten
+        // (or re-presses) 1-2 ticks later, queue it for the next tick so fast taps are never eaten
         if (m_waitTicks >= 0) {
             m_queuedOpposite = (push != m_bufferedPush);
             m_ticksSinceLastInput = 0;
@@ -459,17 +358,16 @@ public:
                           (isDual && p2 && p2->m_isDart && p2->m_vehicleSize < 1.0f);
 
         // 3. STREAK-BASED WAVE SPAM GUARD:
-        // Only bypasses if you perform several rapid inputs in a row (closer together than
-        // "spam-interval" ticks). Single micro-clicks and normal Wave turns around
-        // spikes/sawblades stay 100% protected!
-        if (m_cfg.spamGuard && m_ticksSinceLastInput < m_cfg.spamInterval) {
+        // Only bypasses if you perform 3+ rapid inputs in a row (< 8 ticks apart).
+        // Single micro-clicks and normal Wave turns around spikes/sawblades stay 100% active!
+        if (m_ticksSinceLastInput < SPAM_INTERVAL_TICKS) {
             m_rapidInputStreak++;
         } else {
             m_rapidInputStreak = 0;
         }
         m_ticksSinceLastInput = 0;
 
-        if (isWave && m_cfg.spamGuard && m_rapidInputStreak >= m_cfg.spamStreak) {
+        if (isWave && m_rapidInputStreak >= SPAM_STREAK_REQUIRED) {
             m_gameHolding = push;
             return true;
         }
@@ -484,22 +382,19 @@ public:
 
         m_queuedOpposite = false;
 
-        // Buffer strength for the current mode. 0 = off for this mode.
-        int maxDelayFrames = isWave ? m_cfg.waveTicks : m_cfg.normalTicks;
-        if (maxDelayFrames <= 0) {
-            m_gameHolding = push;
-            return true;
-        }
-
         // Full Show-Trajectory lookahead for Wave (65 ticks / 50 ticks Mini Wave)
         // so it sees spikes and sawblades 1-3 blocks ahead along the diagonal path!
         int targetHorizon = isMiniWave ? 50 : (isWave ? 65 : 160);
+        int maxDelayFrames = isWave ? m_maxTicksWave : m_maxTicksNormal;
 
-        // Long buffers (above the original 16-tick maximum) need a longer lookahead so the
-        // delayed trajectory is still checked far enough ahead.
-        if (maxDelayFrames > FULL_SCAN_LIMIT) {
-            targetHorizon += std::min(maxDelayFrames - FULL_SCAN_LIMIT, MAX_HORIZON_EXTRA);
+        // Extended stages (limits above the original 16-tick maximum) need a longer
+        // lookahead so the delayed trajectory is still checked far enough ahead.
+        if (maxDelayFrames > 16) {
+            targetHorizon += maxDelayFrames - 16;
         }
+
+        // Start counting simulation work for this input.
+        m_stepsUsed = 0;
 
         // 4. Check Frame 0 (immediate input) across the full trajectory horizon
         int ticksFrame0 = getSurvivalTicks(pl, p1, p2, isDual, 0, push, targetHorizon);
@@ -517,23 +412,15 @@ public:
             scanLimit = std::min(scanLimit, (targetHorizon - ticksFrame0 - 6) / 2);
         }
 
-        // Delays 1..16 are tested one by one; above that every "scan-stride"-th delay is tested
-        // (every 2x stride beyond 64 ticks).
-        auto nextStep = [&](int delay) {
-            if (delay < FULL_SCAN_LIMIT) return 1;
-            return delay < 64 ? m_cfg.scanStride : m_cfg.scanStride * 2;
-        };
-
-        // Time limit for the delay search: keeps the frame rate steady. The first candidate
-        // is always tested, then the search stops once the time is up.
-        const auto deadline = Clock::now() + std::chrono::milliseconds(m_cfg.lookaheadMs);
-
         // 5. Frame 0 hits a spike, sawblade, or slope within the horizon!
-        // Scan upwards for the earliest delay that genuinely clears the obstacle.
+        // Scan +1..scanLimit for the earliest delay that genuinely clears the obstacle.
         int bestDelay = 0;
         int bestTicks = ticksFrame0;
 
-        for (int delay = 1; delay <= scanLimit; delay += nextStep(delay)) {
+        for (int delay = 1; delay <= scanLimit; delay += (delay < 16 ? 1 : LARGE_DELAY_STRIDE)) {
+            // Work cap: keeps the frame time bounded no matter which stage is selected.
+            if (m_stepsUsed >= MAX_SIM_STEPS_PER_INPUT) break;
+
             int ticks = getSurvivalTicks(pl, p1, p2, isDual, delay, push, targetHorizon);
 
             if (isWave) {
@@ -563,17 +450,9 @@ public:
                     bestTicks = ticks;
                 }
             }
-
-            if (Clock::now() >= deadline) break;
         }
 
         if (bestDelay > 0) {
-            m_saves++;
-            if (m_cfg.debugLog) {
-                log::debug("[InputBuffer] SAVED +{} ticks ({:.2f} frames @ 60fps) {} (Frame0: {} -> Delayed: {}) [Limit: {}]",
-                    bestDelay, bestDelay / 4.0f, push ? "PRESS" : "RELEASE", ticksFrame0, bestTicks, maxDelayFrames);
-            }
-            syncHud();
             m_bufferedPush = push;
             m_waitTicks = bestDelay;
             return false;
@@ -640,7 +519,7 @@ public:
 static TrajectoryBufferSim s_sim;
 
 $on_mod(Loaded) {
-    log::info("[InputBuffer] v5.0 loaded - configure it in the mod's settings");
+    log::info("[InputBuffer] loaded - choose the stage in the mod's settings");
 }
 
 // ============================================================================
